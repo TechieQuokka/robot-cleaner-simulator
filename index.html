@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Robot Cleaner Path Simulator</title>
+  <meta name="description" content="Write Python to drive a robot vacuum and watch its path — a sandbox for DFS, BFS and other coverage algorithms." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand__icon" aria-hidden="true">🤖</span>
+        <div class="brand__text">
+          <h1>Robot Cleaner Path Simulator</h1>
+          <p>Write Python. Watch it clean.</p>
+        </div>
+      </div>
+      <div class="topbar__actions">
+        <span class="engine-status" id="engineStatus" data-state="loading">Starting engine…</span>
+        <button type="button" class="btn btn--sm" id="settingsBtn">
+          <span aria-hidden="true">⚙</span> Settings
+        </button>
+        <button type="button" class="icon-btn" id="themeToggle" title="Toggle light / dark" aria-label="Toggle light / dark">
+          <span class="icon-btn__light" aria-hidden="true">☀️</span>
+          <span class="icon-btn__dark" aria-hidden="true">🌙</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="workspace" id="workspace">
+      <!-- ── Simulation ──────────────────────────────────────── -->
+      <section class="panel panel--sim" id="simPanel" aria-labelledby="simHeading">
+        <button type="button" class="strip" id="simStrip" title="Expand the simulation">
+          <span aria-hidden="true">▸</span><span class="strip__label">Simulation</span>
+        </button>
+
+        <div class="panel__head">
+          <button type="button" class="collapse" id="simCollapse"
+            aria-expanded="true" aria-controls="simBody" title="Collapse / expand">
+            <span class="collapse__chevron" aria-hidden="true">▾</span>
+            <h2 id="simHeading">Simulation</h2>
+          </button>
+
+          <div class="head__tools">
+            <div class="toolbar" role="group" aria-label="Map tools — F3 / F4 to switch">
+              <label class="tool">
+                <input type="radio" name="tool" value="wall" checked />
+                <span><b aria-hidden="true">🧱</b> Wall</span>
+              </label>
+              <label class="tool">
+                <input type="radio" name="tool" value="erase" />
+                <span><b aria-hidden="true">🧽</b> Erase</span>
+              </label>
+              <label class="tool">
+                <input type="radio" name="tool" value="start" />
+                <span><b aria-hidden="true">🤖</b> Start</span>
+              </label>
+              <label class="tool">
+                <input type="radio" name="tool" value="pan" />
+                <span><b aria-hidden="true">✋</b> Pan</span>
+              </label>
+            </div>
+
+            <div class="zoom" role="group" aria-label="Cell size">
+              <button type="button" class="btn btn--xs" id="zoomOut" title="Smaller cells">−</button>
+              <output id="zoomOut2" class="zoom__value">28px</output>
+              <button type="button" class="btn btn--xs" id="zoomIn" title="Bigger cells">+</button>
+            </div>
+
+            <label class="toggle" title="Keep the camera on the robot">
+              <input type="checkbox" id="followToggle" checked />
+              <span>Follow</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="panel__body" id="simBody">
+          <div class="stage" id="stage">
+            <canvas id="canvas" tabindex="0" aria-label="Map — drag to edit, Pan mode or middle-drag to move"></canvas>
+            <div class="stage__busy" id="busy" hidden>
+              <div class="spinner" aria-hidden="true"></div>
+              <p id="busyText">Running…</p>
+              <button type="button" class="btn btn--sm" id="cancelBtn">Stop</button>
+            </div>
+            <div class="stage__hud" id="hud">10 × 10</div>
+          </div>
+
+          <div class="playback">
+            <div class="playback__buttons">
+              <button type="button" class="btn" id="playBtn" disabled>
+                <span aria-hidden="true">▶</span> Play
+              </button>
+              <button type="button" class="btn" id="stepBtn" disabled title="Advance one step">
+                <span aria-hidden="true">⏭</span> Step
+              </button>
+              <button type="button" class="btn" id="finishBtn" disabled title="Skip to the end">
+                <span aria-hidden="true">⏩</span> Skip
+              </button>
+              <button type="button" class="btn" id="resetBtn" disabled title="Back to the start">
+                <span aria-hidden="true">⏹</span> Reset
+              </button>
+            </div>
+
+            <label class="field field--speed">
+              <span>Speed</span>
+              <input type="range" id="speed" min="0" max="8" step="1" value="2" />
+              <output id="speedOut">Normal</output>
+            </label>
+
+            <div class="progress">
+              <div class="progress__bar"><div class="progress__fill" id="progressFill"></div></div>
+              <span class="progress__label" id="progressLabel">Step 0 / 0</span>
+            </div>
+          </div>
+
+          <dl class="stats">
+            <div><dt>Cleaned</dt><dd id="statCleaned">0</dd></div>
+            <div><dt>Coverage</dt><dd id="statCoverage">0%</dd></div>
+            <div><dt>Moves</dt><dd id="statMoves">0</dd></div>
+            <div><dt>Wall hits</dt><dd id="statHits">0</dd></div>
+            <div><dt>Return</dt><dd id="statReturn">0</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <div class="splitter splitter--x" id="splitX" role="separator"
+        aria-orientation="vertical" tabindex="0" title="Drag to resize · drag to the edge to collapse"></div>
+
+      <!-- ── Code + output ───────────────────────────────────── -->
+      <div class="side" id="side">
+        <button type="button" class="strip" id="sideStrip" title="Expand the editor">
+          <span aria-hidden="true">▸</span><span class="strip__label">Python</span>
+        </button>
+
+        <section class="panel panel--code" id="codePanel" aria-labelledby="codeHeading">
+          <div class="panel__head">
+            <button type="button" class="collapse" id="codeCollapse"
+              aria-expanded="true" aria-controls="codeBody" title="Collapse / expand">
+              <span class="collapse__chevron" aria-hidden="true">▾</span>
+              <h2 id="codeHeading">Python</h2>
+            </button>
+            <select id="sampleSelect" class="select" aria-label="Load a sample">
+              <option value="">Load a sample…</option>
+              <option value="dfsSimple">DFS — minimal</option>
+              <option value="dfsVisited">DFS — with a visited set</option>
+              <option value="dfsIterative">DFS — iterative (no recursion)</option>
+              <option value="wallFollower">Wall follower (right hand)</option>
+              <option value="zigzag">Zigzag sweep (diagonals)</option>
+              <option value="randomWalk">Random walk</option>
+            </select>
+          </div>
+
+          <div class="panel__body" id="codeBody">
+            <div class="editor">
+              <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"
+                aria-label="Python source"></textarea>
+            </div>
+            <div class="panel__foot">
+              <button type="button" class="btn btn--primary btn--block" id="runBtn" disabled>
+                <span aria-hidden="true">▶</span> Run <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <div class="splitter splitter--y" id="splitY" role="separator"
+          aria-orientation="horizontal" tabindex="0" title="Drag to resize · drag to the edge to collapse"></div>
+
+        <section class="panel panel--console" id="consolePanel" aria-labelledby="consoleHeading">
+          <div class="panel__head">
+            <button type="button" class="collapse" id="consoleCollapse"
+              aria-expanded="true" aria-controls="consoleBody" title="Collapse / expand">
+              <span class="collapse__chevron" aria-hidden="true">▾</span>
+              <h2 id="consoleHeading">Output</h2>
+            </button>
+            <div class="btn-row">
+              <button type="button" class="btn btn--xs" id="helpBtn">Help</button>
+              <button type="button" class="btn btn--xs btn--ghost" id="clearConsoleBtn">Clear</button>
+            </div>
+          </div>
+          <div class="panel__body" id="consoleBody">
+            <div class="console" id="console" role="log" aria-live="polite"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- ── Settings dialog ───────────────────────────────────── -->
+  <dialog class="modal" id="settingsDialog" aria-labelledby="settingsTitle">
+    <form method="dialog" class="modal__form">
+      <div class="modal__head">
+        <h2 id="settingsTitle">Settings</h2>
+        <button type="submit" class="icon-btn icon-btn--plain" value="close" aria-label="Close">✕</button>
+      </div>
+
+      <div class="modal__body">
+        <fieldset class="group">
+          <legend>Map</legend>
+          <div class="grid2">
+            <label class="field">
+              <span>Rows</span>
+              <input type="number" id="rows" min="4" max="1024" step="1" value="16" />
+            </label>
+            <label class="field">
+              <span>Columns</span>
+              <input type="number" id="cols" min="4" max="1024" step="1" value="16" />
+            </label>
+          </div>
+          <div class="btn-row">
+            <span class="btn-row__label">Presets</span>
+            <button type="button" class="btn btn--xs preset" data-size="16">16²</button>
+            <button type="button" class="btn btn--xs preset" data-size="64">64²</button>
+            <button type="button" class="btn btn--xs preset" data-size="256">256²</button>
+            <button type="button" class="btn btn--xs preset" data-size="1024">1024²</button>
+          </div>
+          <div class="btn-row">
+            <button type="button" class="btn btn--sm" id="clearMapBtn">Empty room</button>
+            <button type="button" class="btn btn--sm" id="borderBtn">Add border</button>
+            <button type="button" class="btn btn--sm" id="randomBtn">Random room</button>
+          </div>
+          <p class="hint">4 to 1024 per side. Walls of maps larger than 256×256 are not saved between sessions.</p>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Stop rules</legend>
+          <p class="hint">
+            A run succeeds once every non-wall tile has been visited. These rules end
+            one that cannot get there.
+          </p>
+          <label class="field">
+            <span>Consecutive hits on the same wall</span>
+            <input type="number" id="wallLimit" min="1" max="100" step="1" value="5" />
+          </label>
+          <p class="hint">
+            The <b>same</b> wall tile in a row only — a successful move, or a
+            <b>different</b> wall, resets it.
+          </p>
+          <label class="field">
+            <span>Maximum <code>move()</code> calls</span>
+            <input type="number" id="maxCalls" min="10" max="5000000" step="10" value="5000" />
+          </label>
+          <label class="check">
+            <input type="checkbox" id="autoCalls" checked />
+            <span>Auto (floor tiles × 10)</span>
+          </label>
+          <label class="field">
+            <span>Run timeout (seconds)</span>
+            <input type="number" id="timeout" min="5" max="600" step="5" value="20" />
+          </label>
+          <p class="hint">Sensing calls like <code>look()</code> and <code>pos()</code> are free.</p>
+        </fieldset>
+
+        <fieldset class="group">
+          <legend>Display</legend>
+          <label class="field">
+            <span>Cell size — <output id="cellSizeOut">28</output> px</span>
+            <input type="range" id="cellSize" min="4" max="56" step="1" value="28" />
+          </label>
+          <label class="field">
+            <span>Trail length (most recent segments)</span>
+            <input type="number" id="trailCap" min="100" max="400000" step="100" value="20000" />
+          </label>
+          <label class="check"><input type="checkbox" id="showTrail" checked /><span>Cleaning trail</span></label>
+          <label class="check"><input type="checkbox" id="showReturn" checked /><span>Return path (A*)</span></label>
+          <label class="check"><input type="checkbox" id="showHeat" checked /><span>Visit heatmap</span></label>
+          <label class="check"><input type="checkbox" id="showCounts" checked /><span>Visit counts</span></label>
+        </fieldset>
+      </div>
+
+      <div class="modal__foot">
+        <button type="submit" class="btn btn--primary" value="close">Done</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="grid.js"></script>
+  <script src="board.js"></script>
+  <script src="samples.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
