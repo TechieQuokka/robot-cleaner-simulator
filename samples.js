@@ -18,6 +18,7 @@
       '            move(opposite(d))   # back out the way we came',
       '',
       'dfs()',
+      'go_home()                   # back to the dock: this ends the run',
       ''
     ].join('\n'),
 
@@ -41,6 +42,7 @@
       '',
       'dfs()',
       'print("visited", len(visited), "tiles,", remaining(), "left")',
+      'go_home()',
       ''
     ].join('\n'),
 
@@ -62,6 +64,8 @@
       '        if not stack:',
       '            break',
       '        move(opposite(stack.pop()))',
+      '',
+      'go_home()',
       ''
     ].join('\n'),
 
@@ -79,6 +83,8 @@
       '    else:',
       '        print("boxed in at", pos())',
       '        break',
+      '',
+      'go_home()',
       ''
     ].join('\n'),
 
@@ -99,18 +105,22 @@
       '        break',
       '',
       '    heading = opposite(heading)',
+      '',
+      'go_home()',
       ''
     ].join('\n'),
 
     randomWalk: [
-      '# The dumbest possible strategy, for comparison.',
-      '# Direction constants are 0-7, so randrange(8) picks one.',
-      '# Watch the heatmap fill in: most tiles get hit many times over.',
+      '# The dumbest possible strategy, for comparison. Direction',
+      '# constants are 0-7, so randrange(8) picks one. Watch the heatmap:',
+      '# most tiles get hit many times over before the last one is found.',
       '',
       'import random',
       '',
-      'while True:',
+      'while remaining() > 0:',
       '    move(random.randrange(8))',
+      '',
+      'go_home()',
       ''
     ].join('\n')
   };
@@ -121,6 +131,7 @@
     { text: '', variant: null },
     { text: 'MOVING', variant: 'info' },
     { text: '  move(d)        -1 if a wall blocks it, else the visit count of the new tile', variant: 'dim' },
+    { text: '  go_home()      A* back to the start tile — and the run ENDS there', variant: 'dim' },
     { text: '', variant: null },
     { text: 'SENSING  (free — never counts against the move limit)', variant: 'info' },
     { text: '  look(d)        -1 wall · 0 never visited · n visit count', variant: 'dim' },
@@ -137,8 +148,10 @@
     { text: '  CARDINALS · DIAGONALS · DIRECTIONS are ready-made tuples', variant: 'dim' },
     { text: '  opposite(d)  turn_right(d)  turn_left(d)  delta(d)  name(d)', variant: 'dim' },
     { text: '', variant: null },
-    { text: 'ENDING', variant: 'info' },
-    { text: '  ✅ every floor tile visited → the robot returns home via A*', variant: 'dim' },
+    { text: 'ENDING  (you decide — nothing stops the run on its own)', variant: 'info' },
+    { text: '  ✅ go_home() returns the robot to the dock and ends the run', variant: 'dim' },
+    { text: '     sweep as many laps as you like first: while remaining() > 0: ...', variant: 'dim' },
+    { text: '  ⚠ ending without go_home() warns, then follows Settings → Stop rules', variant: 'dim' },
     { text: '  ⛔ same wall hit N times in a row, the move() limit, or the timeout', variant: 'dim' },
     { text: '', variant: null },
     { text: 'MAP CONTROLS', variant: 'info' },

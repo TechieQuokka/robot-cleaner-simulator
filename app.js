@@ -27,6 +27,7 @@
 
   var el = {};
   var board = null;
+  var editor = null;
   var model = null;
   var worker = null;
   var engineReady = false;
@@ -34,14 +35,16 @@
   var runTimer = null;
   var elapsedTimer = null;
   var runStartedAt = 0;
+  var runStats = null;
   var floorCount = 0;
 
   var collapsed = { sim: false, side: false, code: false, console: false };
   var splitX = 0.66;
   var splitY = 0.63;
 
-  /* Playback state */
-  var log = null;          // { kinds, dirs, vals, prints, len }
+  /* Playback state. `log` grows while the worker streams steps in. */
+  var log = null;          // { kinds, dirs, vals, prints, len, cap }
+  var streaming = false;
   var cursor = 0;
   var printIdx = 0;
   var playing = false;
@@ -53,6 +56,44 @@
   var lastResult = null;
   var summaryShown = false;
 
+  /* ---- Streamed log store --------------------------------- */
+
+  function newLog() {
+    return {
+      kinds: new Uint8Array(8192),
+      dirs: new Uint8Array(8192),
+      vals: new Int32Array(8192),
+      cap: 8192,
+      len: 0,
+      prints: []
+    };
+  }
+
+  function appendLog(chunk) {
+    var incoming = chunk.kinds.length;
+    if (incoming) {
+      var needed = log.len + incoming;
+      if (needed > log.cap) {
+        var cap = log.cap;
+        while (cap < needed) cap *= 2;
+        var kinds = new Uint8Array(cap);
+        var dirs = new Uint8Array(cap);
+        var vals = new Int32Array(cap);
+        kinds.set(log.kinds.subarray(0, log.len));
+        dirs.set(log.dirs.subarray(0, log.len));
+        vals.set(log.vals.subarray(0, log.len));
+        log.kinds = kinds; log.dirs = dirs; log.vals = vals; log.cap = cap;
+      }
+      log.kinds.set(chunk.kinds, log.len);
+      log.dirs.set(chunk.dirs, log.len);
+      log.vals.set(chunk.vals, log.len);
+      log.len = needed;
+    }
+    if (chunk.prints && chunk.prints.length) {
+      log.prints = log.prints.concat(chunk.prints);
+    }
+  }
+
   /* ---- Element lookup ------------------------------------- */
 
   function grab() {
@@ -61,13 +102,13 @@
       'workspace', 'side', 'simPanel', 'codePanel', 'consolePanel',
       'simCollapse', 'codeCollapse', 'consoleCollapse', 'simStrip', 'sideStrip',
       'splitX', 'splitY',
-      'sampleSelect', 'code', 'runBtn',
+      'sampleSelect', 'code', 'highlight', 'gutter', 'runBtn',
       'stage', 'canvas', 'hud', 'busy', 'busyText', 'cancelBtn',
       'zoomIn', 'zoomOut', 'zoomOut2', 'followToggle',
       'playBtn', 'stepBtn', 'finishBtn', 'resetBtn',
       'speed', 'speedOut', 'progressFill', 'progressLabel',
       'rows', 'cols', 'clearMapBtn', 'borderBtn', 'randomBtn',
-      'wallLimit', 'maxCalls', 'autoCalls', 'timeout',
+      'wallLimit', 'maxCalls', 'autoCalls', 'timeout', 'onNoReturn',
       'cellSize', 'cellSizeOut', 'trailCap',
       'showTrail', 'showReturn', 'showHeat', 'showCounts',
       'statCleaned', 'statCoverage', 'statMoves', 'statHits', 'statReturn',
@@ -86,6 +127,7 @@
         maxCalls: Number(el.maxCalls.value),
         autoCalls: el.autoCalls.checked,
         timeout: Number(el.timeout.value),
+        onNoReturn: el.onNoReturn.value,
         cellSize: board ? board.cellSize : 28,
         trailCap: Number(el.trailCap.value),
         speed: Number(el.speed.value),
@@ -262,7 +304,7 @@
   function refreshProgress() {
     var total = log ? log.len : 0;
     el.progressLabel.textContent = 'Step ' + cursor.toLocaleString() +
-      ' / ' + total.toLocaleString();
+      ' / ' + total.toLocaleString() + (streaming ? ' (running…)' : '');
     el.progressFill.style.width = total ? ((cursor / total) * 100).toFixed(1) + '%' : '0%';
   }
 
@@ -330,6 +372,11 @@
       robotR = tr; robotC = tc;
       board.placeRobot(tr, tc, animate ? animMs : 0);
     } else if (kind === KIND_RETURN) {
+      /* The robot cleans what it drives over on the way home, too. */
+      var ridx = tr * model.cols + tc;
+      if (visits[ridx] === 0) stats.cleaned++;
+      visits[ridx] = val;
+      board.setVisits(visits);
       stats.returns++;
       board.setReturning(true);
       board.addReturn(robotR, robotC, tr, tc);
@@ -363,7 +410,13 @@
     if (!playing) return;
     var s = speed();
     var animate = s.steps === 1 && s.ms >= 30;
-    if (!advance(s.steps, animate, s.ms) || cursor >= log.len) {
+    advance(s.steps, animate, s.ms);
+    if (cursor >= log.len) {
+      /* Caught up with the worker — wait for more instead of declaring the end. */
+      if (streaming) {
+        playTimer = window.setTimeout(tick, 60);
+        return;
+      }
       finishPlayback();
       return;
     }
@@ -371,8 +424,8 @@
   }
 
   function startPlaying() {
-    if (!log || !log.len) return;
-    if (cursor >= log.len) resetPlayback();
+    if (!log || (!log.len && !streaming)) return;
+    if (!streaming && cursor >= log.len) resetPlayback();
     playing = true;
     updateControls();
     tick();
@@ -415,21 +468,30 @@
           '"DFS — iterative" sample, which does the same walk with an ' +
           'explicit stack, or check for a call that never returns.', 'stop');
       }
-    } else if (lastResult.stopKind === 'complete') {
+    } else if (lastResult.stopKind === 'home') {
       logLine('✅ ' + lastResult.detail, 'ok');
-      if (lastResult.returnPathFound === false) {
-        logLine('No way back to the start tile — the robot stayed put.', 'stop');
-      } else if (stats.returns > 0) {
-        logLine('Returned home via A* in ' + stats.returns + ' moves.', 'ok');
-      } else {
-        logLine('Already home — no return trip needed.', 'ok');
-      }
-    } else if (lastResult.outcome === 'stopped') {
+    } else if (lastResult.stopKind) {
       logLine('⛔ ' + lastResult.detail, 'stop');
-    } else {
-      logLine('Program finished with ' + (floorCount - stats.cleaned) +
-        ' tiles left uncleaned.', 'stop');
     }
+
+    /* Only worth pointing out when the program ran to its end by itself —
+       a run a stop rule cut short never got the chance. */
+    if (!lastResult.homeCalled && lastResult.outcome !== 'error' && !lastResult.stopKind) {
+      logLine('⚠ Your program ended without calling go_home().', 'stop');
+      if (lastResult.autoReturned) {
+        logLine('Brought the robot home automatically (' + stats.returns +
+          ' moves). Change this under Settings → Stop rules.', 'info');
+      } else if (lastResult.returnPathFound === false) {
+        logLine('No path back to the start tile — the robot stayed put.', 'stop');
+      } else {
+        logLine('The robot stopped where it was.', 'info');
+      }
+    }
+
+    var left = floorCount - stats.cleaned;
+    logLine(left > 0
+      ? left.toLocaleString() + ' tiles were never visited.'
+      : 'Every floor tile was visited.', left > 0 ? 'info' : 'ok');
 
     logLine('— ' + stats.moves.toLocaleString() + ' moves · ' +
       stats.hits.toLocaleString() + ' wall hits · ' +
@@ -439,11 +501,11 @@
 
   function updateControls() {
     var hasLog = !!(log && log.len);
-    var atEnd = !hasLog || cursor >= log.len;
-    el.playBtn.disabled = running || !hasLog || (atEnd && !playing);
-    el.stepBtn.disabled = running || atEnd;
-    el.finishBtn.disabled = running || atEnd;
-    el.resetBtn.disabled = running || !hasLog;
+    var atEnd = (!hasLog || cursor >= log.len) && !streaming;
+    el.playBtn.disabled = !hasLog || (atEnd && !playing);
+    el.stepBtn.disabled = !hasLog || cursor >= log.len;
+    el.finishBtn.disabled = !hasLog || cursor >= log.len;
+    el.resetBtn.disabled = !hasLog || streaming;
     el.runBtn.disabled = running || !engineReady;
     el.playBtn.innerHTML = playing
       ? '<span aria-hidden="true">⏸</span> Pause'
@@ -462,7 +524,7 @@
     worker.onmessage = onWorkerMessage;
     worker.onerror = function (event) {
       setEngineStatus('error', 'Engine error');
-      showBusy(false);
+      showRunning(false);
       running = false;
       logLine('Worker error: ' + (event.message || 'unknown'), 'error');
       updateControls();
@@ -486,48 +548,70 @@
     if (data.type === 'fatal') {
       engineReady = false;
       setEngineStatus('error', 'Engine failed to load');
-      showBusy(false);
+      showRunning(false);
       running = false;
       logLine(data.message, 'error');
       logLine('Check your connection and reload — Pyodide is fetched from a CDN.', 'info');
       updateControls();
       return;
     }
+    /* Steps arrive while the program is still running, so playback can start
+       on the first batch instead of waiting for the program to finish. */
+    if (data.type === 'chunk') {
+      if (!log) return;
+      var wasEmpty = log.len === 0;
+      appendLog(data);
+      runStats = data.stats;
+      refreshProgress();
+      if (wasEmpty && log.len) {
+        updateControls();
+        startPlaying();
+      }
+      return;
+    }
+
     if (data.type !== 'result') return;
 
     clearRunTimeout();
     running = false;
-    showBusy(false);
+    streaming = false;
+    showRunning(false);
 
-    log = data.log;
     lastResult = {
       outcome: data.outcome,
       stopKind: data.stopKind,
       detail: data.detail,
+      homeCalled: data.homeCalled,
+      autoReturned: data.autoReturned,
       returnPathFound: data.returnPathFound,
       elapsedMs: data.elapsedMs
     };
 
-    resetPlayback(false);
     logLine('▶ ' + log.len.toLocaleString() + ' steps recorded (' +
       data.stats.calls.toLocaleString() + ' move() calls, ' +
       (data.elapsedMs / 1000).toFixed(2) + 's)', 'info');
+    refreshProgress();
     updateControls();
-    /* A program that never moved still has output and a verdict to show. */
-    if (log.len) startPlaying(); else finishPlayback();
+    /* Nothing was streamed and nothing is playing — show the verdict now. */
+    if (!playing) finishPlayback();
   }
 
-  function showBusy(visible, text) {
+  /* A small badge rather than a curtain: the whole point is to watch the run. */
+  function showRunning(visible) {
     el.busy.hidden = !visible;
-    if (text) el.busyText.textContent = text;
     if (elapsedTimer) { window.clearInterval(elapsedTimer); elapsedTimer = null; }
-    if (visible) {
-      runStartedAt = Date.now();
-      elapsedTimer = window.setInterval(function () {
-        el.busyText.textContent = 'Running your code… ' +
-          ((Date.now() - runStartedAt) / 1000).toFixed(1) + 's';
-      }, 100);
+    if (!visible) return;
+
+    runStartedAt = Date.now();
+    runStats = null;
+    function paint() {
+      var seconds = ((Date.now() - runStartedAt) / 1000).toFixed(1) + 's';
+      el.busyText.textContent = runStats
+        ? seconds + ' · ' + runStats.moves.toLocaleString() + ' moves'
+        : seconds;
     }
+    paint();
+    elapsedTimer = window.setInterval(paint, 100);
   }
 
   function clearRunTimeout() {
@@ -542,24 +626,36 @@
     if (worker) worker.terminate();
     engineReady = false;
     running = false;
-    showBusy(false);
+    streaming = false;
+    showRunning(false);
     setEngineStatus('loading', 'Restarting engine…');
-    if (reason) logLine(reason, 'stop');
+
+    /* Whatever was streamed before the stop is still worth watching. */
+    lastResult = {
+      outcome: 'stopped',
+      stopKind: 'aborted',
+      detail: reason || 'Run stopped.',
+      homeCalled: false,
+      elapsedMs: Date.now() - runStartedAt
+    };
+    refreshProgress();
     updateControls();
+    if (!playing) finishPlayback();
     createWorker();
   }
 
   function run() {
     if (running || !engineReady) return;
     stopPlaying();
-    log = null;
+    log = newLog();
     lastResult = null;
     cursor = 0;
+    streaming = true;
     resetPlayback();
     clearConsole();
 
     running = true;
-    showBusy(true, 'Running your code…');
+    showRunning(true);
     updateControls();
 
     var timeoutMs = Math.max(5, Number(el.timeout.value) || 20) * 1000;
@@ -570,12 +666,13 @@
       grid: model.snapshot(),
       options: {
         wallLimit: Math.max(1, Number(el.wallLimit.value) || 5),
-        maxCalls: Math.max(10, Number(el.maxCalls.value) || 5000)
+        maxCalls: Math.max(10, Number(el.maxCalls.value) || 5000),
+        autoReturn: el.onNoReturn.value === 'auto'
       }
     });
 
     runTimer = window.setTimeout(function () {
-      cancelRun('⛔ Stopped after ' + (timeoutMs / 1000) +
+      cancelRun('Stopped after ' + (timeoutMs / 1000) +
         's without finishing — check for an infinite loop, or raise the timeout.');
     }, timeoutMs);
   }
@@ -643,7 +740,7 @@
 
   function bind() {
     el.runBtn.addEventListener('click', run);
-    el.cancelBtn.addEventListener('click', function () { cancelRun('⛔ Run stopped.'); });
+    el.cancelBtn.addEventListener('click', function () { cancelRun('Stopped by hand.'); });
 
     el.simCollapse.addEventListener('click', function () {
       collapsed.sim = true; applyLayout(); saveState();
@@ -730,6 +827,7 @@
     el.wallLimit.addEventListener('change', saveState);
     el.maxCalls.addEventListener('change', saveState);
     el.timeout.addEventListener('change', saveState);
+    el.onNoReturn.addEventListener('change', saveState);
     el.autoCalls.addEventListener('change', function () {
       el.maxCalls.disabled = el.autoCalls.checked;
       recomputeFloor();
@@ -753,6 +851,9 @@
       if (!key || !RC.SAMPLES[key]) return;
       el.code.value = RC.SAMPLES[key];
       el.sampleSelect.value = '';
+      el.code.scrollTop = 0;
+      el.code.scrollLeft = 0;
+      editor.render();
       saveState();
     });
 
@@ -763,6 +864,7 @@
       if (event.key === 'Tab') {
         event.preventDefault();
         el.code.setRangeText('    ', el.code.selectionStart, el.code.selectionEnd, 'end');
+        editor.render();
         saveState();
       } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
@@ -796,6 +898,7 @@
       if (saved.wallLimit) el.wallLimit.value = String(saved.wallLimit);
       if (saved.maxCalls) el.maxCalls.value = String(saved.maxCalls);
       if (saved.timeout) el.timeout.value = String(saved.timeout);
+      if (saved.onNoReturn) el.onNoReturn.value = saved.onNoReturn;
       if (saved.trailCap) el.trailCap.value = String(saved.trailCap);
       if (saved.speed != null) el.speed.value = String(saved.speed);
       if (saved.autoCalls != null) el.autoCalls.checked = !!saved.autoCalls;
@@ -832,6 +935,9 @@
     board.setCellSize(saved && saved.cellSize ? saved.cellSize : 28);
     board.setTrailCapacity(Number(el.trailCap.value));
     board.setFollow(el.followToggle.checked);
+    editor = new RC.Editor({
+      textarea: el.code, highlight: el.highlight, gutter: el.gutter
+    });
     applyView();
     setMode('wall');
     syncZoom();

@@ -26,6 +26,11 @@ var KIND_RETURN = 2;
 /* Hard ceiling on recorded steps, to keep the log inside a few dozen MB. */
 var MAX_LOG = 2000000;
 
+/* Steps are streamed to the main thread while the program is still running, so
+   a program that never terminates still shows what the robot did. */
+var FLUSH_STEP_GAP = 2048;
+var FLUSH_MS = 60;
+
 var pyodide = null;
 var readyPromise = null;
 var sim = null;
@@ -116,12 +121,61 @@ function Simulation(grid, options) {
   this.returnMoves = 0;
   this.streak = 0;
   this.lastWall = -1;     // flat index of the wall hit on the previous call
+  this.homeCalled = false;
+  this.autoReturned = false;
   this.stopReason = null;
-  this.stopKind = null;   // 'complete' | 'wall' | 'limit' | 'overflow'
+  this.stopKind = null;   // 'home' | 'nopath' | 'wall' | 'limit' | 'overflow'
   this.log = new LogBuffer(Math.min(MAX_LOG, Math.max(4096, this.maxCalls)));
 
-  this.checkCoverage();
+  /* Streaming cursors. */
+  this.flushedAt = 0;
+  this.printsFlushed = 0;
+  this.sinceCheck = 0;
+  this.lastFlush = Date.now();
 }
+
+Simulation.prototype.statsSnapshot = function () {
+  return {
+    calls: this.calls,
+    moves: this.moves,
+    hits: this.hits,
+    cleaned: this.cleaned,
+    floorTotal: this.floorTotal,
+    returnMoves: this.returnMoves
+  };
+};
+
+/** Hand everything recorded since the last flush to the main thread. */
+Simulation.prototype.flush = function () {
+  var from = this.flushedAt;
+  var to = this.log.len;
+  var prints = this.log.prints.slice(this.printsFlushed);
+  if (to === from && !prints.length) return;
+
+  this.flushedAt = to;
+  this.printsFlushed = this.log.prints.length;
+
+  var kinds = this.log.kinds.slice(from, to);
+  var dirs = this.log.dirs.slice(from, to);
+  var vals = this.log.vals.slice(from, to);
+
+  post({
+    type: 'chunk',
+    kinds: kinds, dirs: dirs, vals: vals,
+    prints: prints,
+    stats: this.statsSnapshot()
+  }, [kinds.buffer, dirs.buffer, vals.buffer]);
+};
+
+/* Called after every bridged call; the counter keeps the clock lookup rare. */
+Simulation.prototype.maybeFlush = function () {
+  if (++this.sinceCheck < FLUSH_STEP_GAP) return;
+  this.sinceCheck = 0;
+  var now = Date.now();
+  if (now - this.lastFlush < FLUSH_MS) return;
+  this.lastFlush = now;
+  this.flush();
+};
 
 Simulation.prototype.index = function (r, c) {
   return r * this.cols + c;
@@ -137,13 +191,6 @@ Simulation.prototype.isWall = function (r, c) {
 
 Simulation.prototype.remaining = function () {
   return this.floorTotal - this.cleaned;
-};
-
-Simulation.prototype.checkCoverage = function () {
-  if (this.stopReason === null && this.remaining() <= 0) {
-    this.stopKind = 'complete';
-    this.stopReason = 'All ' + this.floorTotal + ' tiles cleaned.';
-  }
 };
 
 Simulation.prototype.checkCallLimit = function () {
@@ -208,7 +255,6 @@ Simulation.prototype.move = function (dir) {
 
   this.log.push(KIND_MOVE, dir, this.visits[idx]);
 
-  this.checkCoverage();
   this.checkCallLimit();
   this.checkOverflow();
   return this.visits[idx];
@@ -331,10 +377,14 @@ Simulation.prototype.findReturnPath = function () {
   return path.reverse();
 };
 
-/** Append the return trip to the log and park the robot on the start tile. */
-Simulation.prototype.appendReturnTrip = function () {
+/**
+ * Walk the A* path home, recording it as return steps. The robot cleans what
+ * it drives over, exactly like an ordinary move.
+ * @returns {number} steps taken, or -1 when no path home exists.
+ */
+Simulation.prototype.walkHome = function () {
   var path = this.findReturnPath();
-  if (path === null) return false;
+  if (path === null) return -1;
 
   for (var i = 0; i < path.length; i++) {
     var tr = (path[i] / this.cols) | 0;
@@ -345,24 +395,60 @@ Simulation.prototype.appendReturnTrip = function () {
     for (var d = 0; d < 8; d++) {
       if (DELTAS[d][0] === dr && DELTAS[d][1] === dc) { dir = d; break; }
     }
-    this.log.push(KIND_RETURN, dir, 0);
+
+    var idx = tr * this.cols + tc;
+    if (this.visits[idx] === 0) this.cleaned++;
+    this.visits[idx] += 1;
+
+    this.log.push(KIND_RETURN, dir, this.visits[idx]);
     this.r = tr;
     this.c = tc;
+    this.calls++;
     this.returnMoves++;
   }
-  return true;
+  return path.length;
+};
+
+/** go_home(): walk back to the start tile and end the run. */
+Simulation.prototype.goHome = function () {
+  var steps = this.walkHome();
+  if (steps < 0) {
+    this.stopKind = 'nopath';
+    this.stopReason = 'No path back to the start tile.';
+    return -1;
+  }
+  this.homeCalled = true;
+  this.stopKind = 'home';
+  this.stopReason = steps === 0
+    ? 'Already home — go_home() ended the run.'
+    : 'Returned home in ' + steps + ' moves.';
+  return steps;
 };
 
 /* ---- Python bridge --------------------------------------- */
 
-function jsMove(dir) { return sim ? sim.move(dir | 0) : -1; }
-function jsLook(dir) { return sim ? sim.look(dir | 0) : -1; }
+function jsMove(dir) {
+  if (!sim) return -1;
+  var result = sim.move(dir | 0);
+  sim.maybeFlush();
+  return result;
+}
+
+function jsLook(dir) {
+  if (!sim) return -1;
+  var result = sim.look(dir | 0);
+  /* Sensing produces no steps, but a sense-only loop still needs to let the
+     main thread know the program is alive. */
+  sim.maybeFlush();
+  return result;
+}
 function jsVisits(r, c) { return sim ? sim.visitsAt(r | 0, c | 0) : -1; }
 function jsPosR() { return sim ? sim.r : 0; }
 function jsPosC() { return sim ? sim.c : 0; }
 function jsRows() { return sim ? sim.rows : 0; }
 function jsCols() { return sim ? sim.cols : 0; }
 function jsRemaining() { return sim ? sim.remaining() : 0; }
+function jsGoHome() { return sim ? sim.goHome() : -1; }
 function jsStopReason() { return sim && sim.stopReason ? sim.stopReason : null; }
 
 var PRELUDE = [
@@ -418,6 +504,15 @@ var PRELUDE = [
   '    if reason is not None:',
   '        raise SimulationStop(reason)',
   '    return result',
+  '',
+  '',
+  'def go_home():',
+  '    """Walk back to the start tile along an A* shortest path and END the',
+  '    run. Nothing after this call executes."""',
+  '    __js_go_home()',
+  '    reason = __js_stop_reason()',
+  '    if reason is not None:',
+  '        raise SimulationStop(reason)',
   '',
   '',
   'def look(d):',
@@ -488,7 +583,8 @@ var PRELUDE = [
   '',
   '',
   '_API = {',
-  '    "move": move, "look": look, "scan": scan, "pos": pos, "ahead": ahead,',
+  '    "move": move, "go_home": go_home,',
+  '    "look": look, "scan": scan, "pos": pos, "ahead": ahead,',
   '    "visits": visits, "size": size, "remaining": remaining,',
   '    "delta": delta, "name": name,',
   '    "opposite": opposite, "turn_right": turn_right, "turn_left": turn_left,',
@@ -534,6 +630,7 @@ function ensurePyodide() {
     pyodide.globals.set('__js_rows', jsRows);
     pyodide.globals.set('__js_cols', jsCols);
     pyodide.globals.set('__js_remaining', jsRemaining);
+    pyodide.globals.set('__js_go_home', jsGoHome);
     pyodide.globals.set('__js_stop_reason', jsStopReason);
     pyodide.runPython(PRELUDE);
 
@@ -575,11 +672,7 @@ self.onmessage = async function (event) {
   var outcome = 'ok';
   var detail = '';
 
-  if (sim.stopKind === 'complete') {
-    /* Nothing left to clean before the program even starts. */
-    outcome = 'stopped';
-    detail = sim.stopReason;
-  } else {
+  {
     try {
       /* CPython 3.11+ keeps frames on the heap, so deep recursion is fine — a
          full recursive DFS needs one frame per tile plus a few for the API
@@ -611,33 +704,31 @@ self.onmessage = async function (event) {
     detail = sim.stopReason;
   }
 
-  /* Full coverage earns the A* trip home. */
+  /* The program decides when a run ends by calling go_home(). If it simply ran
+     out of code, the configured fallback takes over — but a run a stop rule cut
+     short was aborted, not finished, so it stays where it died. */
+  var endedOnItsOwn = outcome !== 'error' && sim.stopKind === null;
   var returnPathFound = true;
-  if (sim.stopKind === 'complete') {
-    returnPathFound = sim.appendReturnTrip();
+  if (endedOnItsOwn && data.options.autoReturn) {
+    returnPathFound = sim.walkHome() >= 0;
+    sim.autoReturned = returnPathFound;
   }
 
-  var kinds = sim.log.kinds.slice(0, sim.log.len);
-  var dirs = sim.log.dirs.slice(0, sim.log.len);
-  var vals = sim.log.vals.slice(0, sim.log.len);
+  /* Everything has been streamed already; this is the tail plus the verdict. */
+  sim.flush();
 
   post({
     type: 'result',
     outcome: outcome,
     stopKind: sim.stopKind,
     detail: detail,
+    homeCalled: sim.homeCalled,
+    autoReturned: sim.autoReturned,
     returnPathFound: returnPathFound,
     elapsedMs: Date.now() - startedAt,
-    log: { kinds: kinds, dirs: dirs, vals: vals, prints: sim.log.prints, len: sim.log.len },
-    stats: {
-      calls: sim.calls,
-      moves: sim.moves,
-      hits: sim.hits,
-      cleaned: sim.cleaned,
-      floorTotal: sim.floorTotal,
-      returnMoves: sim.returnMoves
-    }
-  }, [kinds.buffer, dirs.buffer, vals.buffer]);
+    totalSteps: sim.log.len,
+    stats: sim.statsSnapshot()
+  });
 
   sim = null;
 };

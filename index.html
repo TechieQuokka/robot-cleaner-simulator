@@ -82,8 +82,8 @@
             <canvas id="canvas" tabindex="0" aria-label="Map — drag to edit, Pan mode or middle-drag to move"></canvas>
             <div class="stage__busy" id="busy" hidden>
               <div class="spinner" aria-hidden="true"></div>
-              <p id="busyText">Running…</p>
-              <button type="button" class="btn btn--sm" id="cancelBtn">Stop</button>
+              <p id="busyText">0.0s</p>
+              <button type="button" class="btn btn--xs" id="cancelBtn">Stop</button>
             </div>
             <div class="stage__hud" id="hud">10 × 10</div>
           </div>
@@ -155,8 +155,12 @@
 
           <div class="panel__body" id="codeBody">
             <div class="editor">
-              <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"
-                aria-label="Python source"></textarea>
+              <div class="editor__gutter" aria-hidden="true"><div id="gutter"></div></div>
+              <div class="editor__area">
+                <pre class="editor__highlight" aria-hidden="true"><code id="highlight"></code></pre>
+                <textarea id="code" spellcheck="false" autocomplete="off" autocapitalize="off"
+                  autocorrect="off" wrap="off" aria-label="Python source"></textarea>
+              </div>
             </div>
             <div class="panel__foot">
               <button type="button" class="btn btn--primary btn--block" id="runBtn" disabled>
@@ -228,9 +232,16 @@
         <fieldset class="group">
           <legend>Stop rules</legend>
           <p class="hint">
-            A run succeeds once every non-wall tile has been visited. These rules end
-            one that cannot get there.
+            A run ends when your code calls <code>go_home()</code>. The rules below end
+            one that never gets there.
           </p>
+          <label class="field">
+            <span>If the program ends without <code>go_home()</code></span>
+            <select id="onNoReturn" class="select">
+              <option value="auto">Return home automatically</option>
+              <option value="stay">Stop where it is</option>
+            </select>
+          </label>
           <label class="field">
             <span>Consecutive hits on the same wall</span>
             <input type="number" id="wallLimit" min="1" max="100" step="1" value="5" />
@@ -279,6 +290,7 @@
 
   <script src="grid.js"></script>
   <script src="board.js"></script>
+  <script src="editor.js"></script>
   <script src="samples.js"></script>
   <script src="app.js"></script>
 </body>

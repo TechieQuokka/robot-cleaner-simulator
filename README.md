@@ -6,12 +6,14 @@ No build step; it deploys to Vercel's free tier as-is.
 
 ## How it works
 
-1. Write Python in the editor on the right.
-2. The code runs to completion inside a **Web Worker running Pyodide** (CPython on WASM),
-   recording every move the robot makes.
-3. The main thread replays that log as an animation, drawing the trail on the grid.
+1. Write Python in the editor on the right — with syntax highlighting and line numbers.
+2. The code runs inside a **Web Worker running Pyodide** (CPython on WASM), which
+   **streams** each batch of steps to the page while the program is still running.
+3. The main thread animates them live, drawing the trail on the grid.
 
-Running in a worker means an infinite loop can be terminated without freezing the page.
+Because steps stream out as they happen, a program that loops forever still shows
+exactly what the robot did before it got stuck — and the worker can be terminated
+without freezing the page. `Stop` and the timeout both keep whatever was recorded.
 
 ## Python API
 
@@ -22,6 +24,7 @@ Everything below is already defined — no imports, no constants to declare.
 | Call | Returns |
 | --- | --- |
 | `move(d)` | `-1` if a wall blocks the way (the robot stays put), otherwise the **visit count** of the tile just entered (`1`, `2`, `3`, …) |
+| `go_home()` | Walks back to the start tile along an **A\*** shortest path and **ends the run**. Nothing after this call executes. |
 
 ### Sensing — free, never counts against the move limit
 
@@ -61,19 +64,31 @@ def dfs():
             move(opposite(d))     # back out the way we came
 
 dfs()
+go_home()
 ```
 
 ## How a run ends
 
+**Your code decides.** Nothing stops the run on its own — full coverage is not an
+ending, so you can sweep as many laps as you want before docking:
+
+```python
+for lap in range(3):
+    sweep()
+go_home()          # this is the ending
+```
+
 | Outcome | Condition |
 | --- | --- |
-| ✅ **Cleaned** | Every non-wall tile has been visited at least once. The run stops immediately and the simulator walks the robot home along an **A\*** shortest path, drawn as a dashed second trail. |
+| ✅ **Home** | `go_home()` ran. The return trip is drawn as a dashed second trail. |
+| ⚠ No return | The program ended without calling `go_home()`. The output warns, then follows *Settings → Stop rules*: return home automatically (default) or stop where it is. |
 | ⛔ Stuck | The same wall tile was hit N times in a row (default 5). A successful move — or hitting a *different* wall — resets that counter. |
 | ⛔ Out of budget | The `move()` call limit was reached. With **Auto** on it is `floor tiles × 10`, capped at the 2,000,000-step log ceiling. |
 | ⛔ Timeout | The run took longer than the configured timeout (default 20s); the worker is terminated. |
 
 The A\* return uses exactly the same movement rules as `move()` — eight directions,
-diagonals allowed wherever a `move()` would be — so a path home always exists.
+diagonals allowed wherever a `move()` would be — so a path home always exists, and
+the robot cleans what it drives over on the way back.
 
 ## The map
 
@@ -105,6 +120,10 @@ horizontally between simulation and editor, vertically between editor and output
 Drag a splitter to the far edge to collapse that region into a strip; double-click
 resets it. Below 980px everything stacks into one column.
 
+In the editor, `Tab` inserts four spaces and `Ctrl`/`Cmd`+`Enter` runs. The output
+panel doubles as the reference: it prints the full API on load, and the **Help**
+button brings it back.
+
 ## Running locally
 
 Web Workers are blocked on `file://`, so serve the folder:
@@ -135,6 +154,7 @@ Connecting a Git repository and pushing works the same way.
 | --- | --- |
 | `index.html` | Layout and settings dialog |
 | `styles.css` | Design tokens, light/dark, splitters, responsive rules |
+| `editor.js` | Python highlighter and line-number gutter |
 | `grid.js` | Map model (walls, start tile, resizing) |
 | `board.js` | Canvas renderer, camera and map editor |
 | `samples.js` | Sample algorithms and the console help text |
@@ -146,6 +166,8 @@ Connecting a Git repository and pushing works the same way.
 - The move log is stored as parallel typed arrays (kind, direction, value) and
   transferred from the worker without copying: a million steps costs about 6 MB.
   Positions are recomputed during replay rather than stored.
+- Steps are flushed to the page roughly every 60ms, so playback starts on the first
+  batch instead of waiting for the program to finish.
 - Only the most recent trail segments are drawn (20,000 by default, configurable).
   The visit heatmap is always exact, so coverage stays readable at any size.
 - The recursion limit is raised per run to `floor tiles × 2 + 5000`, capped at
